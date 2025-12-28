@@ -3,7 +3,8 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import { CampaignStatus, EmailLogStatus, Status } from './generated/prisma/client.js';
 import imaps from 'imap-simple';
-import type { Campaign, Company, Contact, EmailLog, EmailSettings, Template, User } from './generated/prisma/client.js';
+import { adjustForWeekend, getScheduleTime } from './lib/utils.js';
+import type { Campaign, Company, Contact, EmailLog, EmailSettings, Preferences, Template, User } from './generated/prisma/client.js';
 
 dotenv.config();
 
@@ -34,6 +35,7 @@ async function processEmailQueue() {
             user: {
               include: {
                 emailSettings: true,
+                preferences: true,
               },
             },
           },
@@ -63,7 +65,7 @@ async function processEmailQueue() {
 }
 
 async function processSingleLog(log: EmailLog & {
-  campaign: Campaign & { user: User & { emailSettings: EmailSettings } },
+  campaign: Campaign & { user: User & { emailSettings: EmailSettings, preferences: Preferences | null } },
   template: Template | null,
   contact: (Contact & { company: Company }) | null
 }) {
@@ -96,8 +98,38 @@ async function processSingleLog(log: EmailLog & {
   });
 
   // Prepare email content
-  const subject = replaceVariables(template.subject, contact);
+  let subject = replaceVariables(template.subject, contact);
   const body = replaceVariables(template.body, contact);
+
+  // Threading logic
+  let inReplyTo: string | undefined;
+  let references: string | undefined;
+
+  if (sequence > 1) {
+    const firstLog = await prisma.emailLog.findFirst({
+      where: {
+        campaignId: campaign.id,
+        contactId: contact.id,
+        sequence: 1,
+        status: EmailLogStatus.SENT
+      },
+      include: {
+        template: true
+      }
+    });
+
+    if (firstLog && firstLog.messageId && firstLog.template) {
+      console.log(`[Worker] Threading email (Seq: ${sequence}) to ${firstLog.messageId}`);
+      inReplyTo = firstLog.messageId;
+      references = firstLog.messageId;
+
+      // Use original subject with Re: prefix
+      const originalSubject = replaceVariables(firstLog.template.subject, contact);
+      subject = `Re: ${originalSubject}`;
+    } else {
+      console.warn(`[Worker] Could not find first email for threading (Seq: ${sequence}). Sending as new thread.`);
+    }
+  }
 
   // Setup transporter
   const transporter = nodemailer.createTransport({
@@ -116,6 +148,8 @@ async function processSingleLog(log: EmailLog & {
       to: contact.email,
       subject: subject,
       html: body,
+      inReplyTo: inReplyTo,
+      references: references,
     });
 
     console.log(`[Worker] Email sent: ${info.messageId} (Log ID: ${log.id})`);
@@ -131,7 +165,8 @@ async function processSingleLog(log: EmailLog & {
     });
 
     // Schedule next email in sequence
-    await scheduleNextEmail(campaign.id, contact.id, sequence);
+    const preferences = user.preferences || { mailSendingTime: "09:00", sendOnWeekends: false };
+    await scheduleNextEmail(campaign.id, contact.id, sequence, preferences);
 
   } catch (error: any) {
     console.error(`[Worker] Failed to send email (Log ID: ${log.id}):`, error);
@@ -146,7 +181,12 @@ async function processSingleLog(log: EmailLog & {
   }
 }
 
-async function scheduleNextEmail(campaignId: string, contactId: string, currentSequence: number) {
+async function scheduleNextEmail(
+  campaignId: string,
+  contactId: string,
+  currentSequence: number,
+  preferences: { mailSendingTime: string, sendOnWeekends: boolean }
+) {
   const nextSequence = currentSequence + 1;
 
   // Find the template for the next sequence
@@ -162,8 +202,15 @@ async function scheduleNextEmail(campaignId: string, contactId: string, currentS
   }
 
   const delayDays = nextCampaignTemplate.delay || 1;
-  const scheduledAt = new Date();
-  scheduledAt.setDate(scheduledAt.getDate() + delayDays);
+
+  // Calculate Target Time based on previous sent time + delay, but snap to preference time
+  const baseTime = new Date(); // Ideally this should be the sent time passed in, but "now" is close enough for worker context
+  baseTime.setDate(baseTime.getDate() + delayDays);
+
+  const [hours, minutes] = preferences.mailSendingTime.split(':').map(Number);
+  baseTime.setUTCHours(hours || 0, minutes || 0, 0, 0);
+
+  const scheduledAt = adjustForWeekend(baseTime, preferences.sendOnWeekends);
 
   console.log(`[Worker] Scheduling next email (Seq: ${nextSequence}) for Contact ${contactId} at ${scheduledAt.toISOString()}`);
 
