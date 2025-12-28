@@ -3,7 +3,7 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import { CampaignStatus, EmailLogStatus, Status } from './generated/prisma/client.js';
 import imaps from 'imap-simple';
-import { adjustForWeekend, getScheduleTime } from './lib/utils.js';
+import { adjustForWeekend, getNextScheduleTime } from './lib/utils.js';
 import type { Campaign, Company, Contact, EmailLog, EmailSettings, Preferences, Template, User } from './generated/prisma/client.js';
 
 dotenv.config();
@@ -155,7 +155,7 @@ async function processSingleLog(log: EmailLog & {
     console.log(`[Worker] Email sent: ${info.messageId} (Log ID: ${log.id})`);
 
     // Update log to SENT
-    await prisma.emailLog.update({
+    const updatedLog = await prisma.emailLog.update({
       where: { id: log.id },
       data: {
         status: EmailLogStatus.SENT,
@@ -165,8 +165,8 @@ async function processSingleLog(log: EmailLog & {
     });
 
     // Schedule next email in sequence
-    const preferences = user.preferences || { mailSendingTime: "09:00", sendOnWeekends: false };
-    await scheduleNextEmail(campaign.id, contact.id, sequence, preferences);
+    const preferences = user.preferences || { mailSendingTime: "09:00", sendOnWeekends: false, timezone: "Asia/Kolkata" };
+    await scheduleNextEmail(campaign.id, contact.id, sequence, preferences, updatedLog.sentAt || new Date());
 
   } catch (error: any) {
     console.error(`[Worker] Failed to send email (Log ID: ${log.id}):`, error);
@@ -185,7 +185,8 @@ async function scheduleNextEmail(
   campaignId: string,
   contactId: string,
   currentSequence: number,
-  preferences: { mailSendingTime: string, sendOnWeekends: boolean }
+  preferences: { mailSendingTime: string, sendOnWeekends: boolean, timezone: string },
+  lastSentAt: Date
 ) {
   const nextSequence = currentSequence + 1;
 
@@ -204,14 +205,7 @@ async function scheduleNextEmail(
   const delayDays = nextCampaignTemplate.delay || 1;
 
   // Calculate Target Time based on previous sent time + delay, but snap to preference time
-  const baseTime = new Date(); // Ideally this should be the sent time passed in, but "now" is close enough for worker context
-  baseTime.setDate(baseTime.getDate() + delayDays);
-
-  const [hours, minutes] = preferences.mailSendingTime.split(':').map(Number);
-  baseTime.setUTCHours(hours || 0, minutes || 0, 0, 0);
-
-  const scheduledAt = adjustForWeekend(baseTime, preferences.sendOnWeekends);
-
+  const scheduledAt = getNextScheduleTime(preferences.mailSendingTime, preferences.timezone, preferences.sendOnWeekends, lastSentAt, delayDays);
   console.log(`[Worker] Scheduling next email (Seq: ${nextSequence}) for Contact ${contactId} at ${scheduledAt.toISOString()}`);
 
   await prisma.emailLog.create({
