@@ -3,7 +3,8 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import { CampaignStatus, EmailLogStatus, Status } from './generated/prisma/client.js';
 import imaps from 'imap-simple';
-import { adjustForWeekend, getNextScheduleTime } from './lib/utils.js';
+import path from 'path';
+import { getNextScheduleTime } from './lib/utils.js';
 import type { Campaign, Company, Contact, EmailLog, EmailSettings, Preferences, Template, User } from './generated/prisma/client.js';
 
 dotenv.config();
@@ -142,6 +143,11 @@ async function processSingleLog(log: EmailLog & {
     },
   });
 
+  const attachments = template.attachments.map(att => ({
+    filename: att.split('/').pop() || 'attachment',
+    path: path.join(process.cwd(), '../frost/public', att)
+  }));
+
   try {
     const info = await transporter.sendMail({
       from: `"${emailSettings.fromName || user.name}" <${emailSettings.fromEmail || user.email}>`,
@@ -150,6 +156,7 @@ async function processSingleLog(log: EmailLog & {
       html: body,
       inReplyTo: inReplyTo,
       references: references,
+      attachments: attachments
     });
 
     console.log(`[Worker] Email sent: ${info.messageId} (Log ID: ${log.id})`);
@@ -178,6 +185,10 @@ async function processSingleLog(log: EmailLog & {
         retryCount: { increment: 1 },
       },
     });
+    await prisma.contact.update({
+      where: { id: contact.id },
+      data: { status: Status.FAILED },
+    });
   }
 }
 
@@ -202,7 +213,7 @@ async function scheduleNextEmail(
     return;
   }
 
-  const delayDays = nextCampaignTemplate.delay || 1;
+  const delayDays = nextCampaignTemplate.delay;
 
   // Calculate Target Time based on previous sent time + delay, but snap to preference time
   const scheduledAt = getNextScheduleTime(preferences.mailSendingTime, preferences.timezone, preferences.sendOnWeekends, lastSentAt, delayDays);
