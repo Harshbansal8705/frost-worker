@@ -3,9 +3,10 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import { CampaignStatus, EmailLogStatus, Status } from './generated/prisma/client.js';
 import imaps from 'imap-simple';
-import path from 'path';
-import { getNextScheduleTime } from './lib/utils.js';
+import { getNextScheduleTime, streamToBuffer } from './lib/utils.js';
 import type { Campaign, Company, Contact, EmailLog, EmailSettings, Preferences, Template, User } from './generated/prisma/client.js';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { s3Client } from './lib/r2.js';
 
 dotenv.config();
 
@@ -92,63 +93,75 @@ async function processSingleLog(log: EmailLog & {
     return;
   }
 
-  // Update status to PROCESSING
-  await prisma.emailLog.update({
-    where: { id: log.id },
-    data: { status: EmailLogStatus.PROCESSING }
-  });
-
-  // Prepare email content
-  let subject = replaceVariables(template.subject, contact);
-  const body = replaceVariables(template.body, contact);
-
-  // Threading logic
-  let inReplyTo: string | undefined;
-  let references: string | undefined;
-
-  if (sequence > 1) {
-    const firstLog = await prisma.emailLog.findFirst({
-      where: {
-        campaignId: campaign.id,
-        contactId: contact.id,
-        sequence: 1,
-        status: EmailLogStatus.SENT
-      },
-      include: {
-        template: true
-      }
+  try {
+    // Update status to PROCESSING
+    await prisma.emailLog.update({
+      where: { id: log.id },
+      data: { status: EmailLogStatus.PROCESSING }
     });
 
-    if (firstLog && firstLog.messageId && firstLog.template) {
-      console.log(`[Worker] Threading email (Seq: ${sequence}) to ${firstLog.messageId}`);
-      inReplyTo = firstLog.messageId;
-      references = firstLog.messageId;
+    // Prepare email content
+    let subject = replaceVariables(template.subject, contact);
+    const body = replaceVariables(template.body, contact);
 
-      // Use original subject with Re: prefix
-      const originalSubject = replaceVariables(firstLog.template.subject, contact);
-      subject = `Re: ${originalSubject}`;
-    } else {
-      console.warn(`[Worker] Could not find first email for threading (Seq: ${sequence}). Sending as new thread.`);
+    // Threading logic
+    let inReplyTo: string | undefined;
+    let references: string | undefined;
+
+    if (sequence > 1) {
+      const firstLog = await prisma.emailLog.findFirst({
+        where: {
+          campaignId: campaign.id,
+          contactId: contact.id,
+          sequence: 1,
+          status: EmailLogStatus.SENT
+        },
+        include: {
+          template: true
+        }
+      });
+
+      if (firstLog && firstLog.messageId && firstLog.template) {
+        console.log(`[Worker] Threading email (Seq: ${sequence}) to ${firstLog.messageId}`);
+        inReplyTo = firstLog.messageId;
+        references = firstLog.messageId;
+
+        // Use original subject with Re: prefix
+        const originalSubject = replaceVariables(firstLog.template.subject, contact);
+        subject = `Re: ${originalSubject}`;
+      } else {
+        console.warn(`[Worker] Could not find first email for threading (Seq: ${sequence}). Sending as new thread.`);
+      }
     }
-  }
 
-  // Setup transporter
-  const transporter = nodemailer.createTransport({
-    host: emailSettings.smtpHost || "smtp.gmail.com",
-    port: emailSettings.smtpPort || 587,
-    secure: emailSettings.smtpPort === 465,
-    auth: {
-      user: emailSettings.smtpUser || emailSettings.fromEmail || user.email,
-      pass: emailSettings.smtpPassword || "",
-    },
-  });
+    // Setup transporter
+    const transporter = nodemailer.createTransport({
+      host: emailSettings.smtpHost || "smtp.gmail.com",
+      port: emailSettings.smtpPort || 587,
+      secure: emailSettings.smtpPort === 465,
+      auth: {
+        user: emailSettings.smtpUser || emailSettings.fromEmail || user.email,
+        pass: emailSettings.smtpPassword || "",
+      },
+    });
 
-  const attachments = template.attachments.map(att => ({
-    filename: att.split('/').pop() || 'attachment',
-    path: path.join(process.cwd(), '../frost/public', att)
-  }));
+    const attachments = await Promise.all(
+      template.attachments.map(async (attKey) => {
+        const command = new GetObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: `uploads/${attKey}`,
+        });
 
-  try {
+        const response = await s3Client.send(command);
+        const buffer = await streamToBuffer(response.Body);
+
+        return {
+          filename: attKey.split('/').pop() || 'attachment',
+          content: buffer,
+        };
+      })
+    );
+
     const info = await transporter.sendMail({
       from: `"${emailSettings.fromName || user.name}" <${emailSettings.fromEmail || user.email}>`,
       to: contact.email,

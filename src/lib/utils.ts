@@ -115,3 +115,11 @@ export function utcToLocal(utcDate: Date, timezone: string): Date {
   const d = new Date(utcDate.getTime() + offsetMs);
   return d;
 }
+
+export const streamToBuffer = async (stream: any): Promise<Buffer> => {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+};
